@@ -33,8 +33,12 @@ export function summarize(samples) {
     unavailable_percentiles: {},
   };
   if (durations.length) {
-    const first = Math.min(...successful.map((sample) => sample.start_ns));
-    const last = Math.max(...successful.map((sample) => sample.end_ns));
+    let first = Infinity;
+    let last = -Infinity;
+    for (const sample of successful) {
+      if (sample.start_ns < first) first = sample.start_ns;
+      if (sample.end_ns > last) last = sample.end_ns;
+    }
     const window = last - first;
     result.mean_ns = durations.reduce((sum, value) => sum + value, 0) / durations.length;
     result.max_ns = durations[durations.length - 1];
