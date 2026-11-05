@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
-import { open, readFile, writeFile, mkdir } from "node:fs/promises";
+import { open, readFile, writeFile, mkdir, lstat } from "node:fs/promises";
 import { platform, release } from "node:os";
 import { extname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -120,7 +120,13 @@ async function layerfsTreeWalk(client, branch) {
 }
 async function nativeTreeWalk(worktree) {
   const paths = (await gitAsync(["ls-files", "-z"], worktree)).split("\0").filter(Boolean);
-  assert.ok(paths.some((path) => TYPES.has(extname(path))), "tree walk selected no source files");
+  let found = 0;
+  for (const path of paths) {
+    if (!TYPES.has(extname(path))) continue;
+    const meta = await lstat(join(worktree, path));
+    if (meta.isFile()) found++;
+  }
+  assert.ok(found > 0, "tree walk selected no source files");
 }
 function cacheLabel(mode, opts) {
   return mode === "warm" ? "warm-preconditioned" : opts["cold-hook"] ? "cold-verified-by-hook" : "cold-first-touch-unverified";
@@ -198,7 +204,7 @@ async function runArm(opts, context, recorder, backend, mode, agents, runtime) {
     if (backend === "layerfs") {
       project = await recorder.measure(m("project_init"), () => initialized(runtime, initializedName, context.snapshot));
       sdkEnvironment(runtime, project);
-      client = await LayerFS.open(initializedName);
+      client = await recorder.measure(m("sdk_open"), () => LayerFS.open(initializedName));
     }
     cacheEvidence(opts, { backend, cache: mode, phase: "fork", agents }, context.cacheProofs);
     for (let id = 0; id < agents; id++) {
