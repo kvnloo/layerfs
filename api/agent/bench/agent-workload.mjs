@@ -192,7 +192,13 @@ function quoteShell(value) {
 
 async function runArm(opts, context, recorder, backend, mode, agents, runtime) {
   const cache = cacheLabel(mode, opts);
-  const m = (operation, agent = -1, sequence = 0) => ({ backend, cache, agents, agent, operation, sequence });
+  const m = (operation, agent = -1, sequence = 0) => ({
+    backend,
+    cache: ["project_init", "sdk_open"].includes(operation) || (mode === "warm" && ["worktree_fork", "scratch_mkdir"].includes(operation))
+      ? "setup-unconditioned"
+      : cache,
+    agents, agent, operation, sequence,
+  });
   const handles = [];
   const cleanupFailures = [];
   let project = null;
