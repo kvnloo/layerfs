@@ -360,6 +360,7 @@ async function main() {
   };
   const snapshot = join(opts.out, "source-snapshot");
   let runtime = null;
+  let workerStarted = false;
   let outcome = { status: "FAILED", reason: "incomplete" };
   let succeeded = false;
   try {
@@ -391,7 +392,10 @@ async function main() {
     });
     const state = await runtime.status();
     if (state.missing.length) throw new Error("LayerFS runtime is missing: " + state.missing.join(", "));
-    if (platform() === "darwin") await runtime.worker.start();
+    if (platform() === "darwin") {
+      await runtime.worker.start();
+      workerStarted = true;
+    }
     for (const mode of opts.cache) {
       for (const agents of opts.agents) {
         const order = agents === 4 ? ["layerfs", "git"] : ["git", "layerfs"];
@@ -408,6 +412,16 @@ async function main() {
     if (runtime) {
       try { await runtime.close(); } catch (error) {
         outcome = { status: "FAILED", reason: (outcome.reason ?? "") + "; runtime.close: " + error.message };
+        succeeded = false;
+      }
+    }
+    if (workerStarted && succeeded) {
+      try {
+        const name = runtime.settings.containerPrefix + "worker";
+        await recorder.measure({ backend: "layerfs", cache: "teardown", agents: 0, operation: "worker_remove" }, () =>
+          exec("docker", ["-H", "unix://" + runtime.settings.docker, "rm", "-f", name]));
+      } catch (error) {
+        outcome = { status: "FAILED", reason: "owned macOS worker cleanup: " + error.message };
         succeeded = false;
       }
     }
