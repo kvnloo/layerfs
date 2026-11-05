@@ -5,8 +5,8 @@ import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { open, readFile, writeFile, mkdir } from "node:fs/promises";
-import { tmpdir, platform, release } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { platform, release } from "node:os";
+import { extname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { setTimeout as pause } from "node:timers/promises";
@@ -16,7 +16,7 @@ import { Recorder } from "./stats.mjs";
 
 const exec = promisify(execFile);
 const TYPES = new Set([".rs", ".js", ".mjs", ".ts", ".tsx", ".py", ".md", ".toml", ".json", ".txt", ".yml", ".yaml"]);
-const TREE_PATTERNS = ["**/*.rs", "**/*.js", "**/*.ts", "**/*.py", "**/*.md", "**/*.toml", "**/*.json"];
+const TREE_PATTERNS = [...TYPES].map((extension) => "**/*" + extension);
 const USAGE = "node api/agent/bench/agent-workload.mjs --repo DIR --ref COMMIT --out NEW_DIR --image sha256:DIGEST --bundle SEALED_LINUX_BUNDLE [--daemon BIN] [--agents 1,4,16] [--edits 128] [--reads 128] [--cache cold,warm] [--cold-hook ABSOLUTE_EXECUTABLE]";
 
 function options(argv) {
@@ -26,14 +26,14 @@ function options(argv) {
     process.exit(0);
   }
   if (argv.length % 2) throw new Error(USAGE);
+  const supplied = new Set();
   for (let i = 0; i < argv.length; i += 2) {
     const key = argv[i];
     if (!key.startsWith("--") || !["repo", "ref", "out", "image", "bundle", "daemon", "docker", "agents", "edits", "reads", "cache", "cold-hook"].includes(key.slice(2))) {
       throw new Error("unknown option " + key + "\n" + USAGE);
     }
-    if (Object.hasOwn(result, key.slice(2)) && !["agents", "edits", "reads", "cache", "ref"].includes(key.slice(2))) {
-      throw new Error("duplicate option " + key);
-    }
+    if (supplied.has(key)) throw new Error("duplicate option " + key);
+    supplied.add(key);
     result[key.slice(2)] = argv[i + 1];
   }
   if (!result.repo || !result.out || !/^sha256:[0-9a-f]{64}$/.test(result.image ?? "")) throw new Error(USAGE);
@@ -134,7 +134,8 @@ function cacheEvidence(opts, meta, proofs) {
   const response = spawnSync(opts["cold-hook"], [], {
     encoding: "utf8",
     timeout: 60_000,
-    env: { ...process.env, BENCH_BACKEND: meta.backend, BENCH_PHASE: meta.phase, BENCH_AGENTS: String(meta.agents) },
+    env: { ...process.env, LAYERFS_VOLUME: meta.backend === "layerfs" ? (process.env.LAYERFS_VOLUME ?? "") : "",
+      BENCH_BACKEND: meta.backend, BENCH_PHASE: meta.phase, BENCH_AGENTS: String(meta.agents) },
   });
   if (response.error || response.status !== 0) throw new Error("cold hook failed: " + (response.stderr || response.error?.message || response.status));
   const proof = JSON.parse(response.stdout);
@@ -204,12 +205,13 @@ async function runArm(opts, context, recorder, backend, mode, agents, runtime) {
       const handle = { id, branch: "agent-" + id, path: join(opts.out, "worktrees", mode + "-" + agents + "-" + id) };
       if (backend === "layerfs") {
         await recorder.measure(m("worktree_fork", id), () => client.branch.fork(handle.branch, "main"));
+        handles.push(handle);
         await recorder.measure(m("scratch_mkdir", id), () => client.fs.mkdir(handle.branch, "/.agent-workload"));
       } else {
         await recorder.measure(m("worktree_fork", id), () => gitAsync(["worktree", "add", "--detach", "--", handle.path, context.sha], context.snapshot));
+        handles.push(handle);
         await recorder.measure(m("scratch_mkdir", id), () => mkdir(join(handle.path, ".agent-workload")));
       }
-      handles.push(handle);
     }
     await precondition(mode, backend, handles, context.files, client);
     cacheEvidence(opts, { backend, cache: mode, phase: "edit", agents }, context.cacheProofs);
@@ -220,18 +222,25 @@ async function runArm(opts, context, recorder, backend, mode, agents, runtime) {
         const path = "/.agent-workload/" + file;
         if (backend === "layerfs") {
           await recorder.measure(m("small_write", handle.id, sequence), () => client.fs.write(handle.branch, path, value));
-          const read = await recorder.measure(m("small_read_after_write", handle.id, sequence), () => client.fs.read(handle.branch, path));
-          assert.equal(read.text, value);
+          await recorder.measure(m("small_read_after_write", handle.id, sequence), async () => {
+            const read = await client.fs.read(handle.branch, path);
+            assert.equal(read.text, value);
+          });
         } else {
           const absolute = join(handle.path, ".agent-workload", file);
           await recorder.measure(m("small_write", handle.id, sequence), () => writeFile(absolute, value));
-          const read = await recorder.measure(m("small_read_after_write", handle.id, sequence), () => readFile(absolute, "utf8"));
-          assert.equal(read, value);
+          await recorder.measure(m("small_read_after_write", handle.id, sequence), async () => {
+            const read = await readFile(absolute, "utf8");
+            assert.equal(read, value);
+          });
         }
       }
       const changed = trackedEdit(context.tracked, context.trackedContent, handle.id);
       if (backend === "layerfs") {
-        await recorder.measure(m("tracked_edit", handle.id), () => client.fs.write(handle.branch, "/" + context.tracked, changed));
+        await recorder.measure(m("tracked_edit", handle.id), async () => {
+          const result = await client.fs.write(handle.branch, "/" + context.tracked, changed);
+          assert.equal(result.kind, "Committed");
+        });
       } else {
         await recorder.measure(m("tracked_edit", handle.id), () => writeFile(join(handle.path, context.tracked), changed));
       }
@@ -247,8 +256,10 @@ async function runArm(opts, context, recorder, backend, mode, agents, runtime) {
       for (let sequence = 0; sequence < opts.reads; sequence++) {
         const file = context.files[(sequence + handle.id * 7) % context.files.length];
         if (backend === "layerfs") {
-          const value = await recorder.measure(m("build_small_read", handle.id, sequence), () => client.fs.read(handle.branch, "/" + file, 1, 8));
-          assert.equal(typeof value.text, "string");
+          await recorder.measure(m("build_small_read", handle.id, sequence), async () => {
+            const value = await client.fs.read(handle.branch, "/" + file, 1, 8);
+            assert.equal(typeof value.text, "string");
+          });
         } else {
           await recorder.measure(m("build_small_read", handle.id, sequence), () => nativeSmallRead(join(handle.path, file)));
         }
@@ -263,15 +274,23 @@ async function runArm(opts, context, recorder, backend, mode, agents, runtime) {
       if (backend === "layerfs") {
         const mounted = await recorder.measure(m("workspace_mount", handle.id), () => client.workspace.mount(sandbox, handle.branch));
         handle.ws = { sandbox: mounted.sandbox, path: mounted.path };
-        const status = await recorder.measure(m("git_status", handle.id), () => client.workspace.exec(handle.ws, "git status --porcelain=v1 --untracked-files=no"));
-        assert.ok(checkExec(status, "git status").trim(), "edited tracked file absent from git status");
-        const diff = await recorder.measure(m("git_diff", handle.id), () => client.workspace.exec(handle.ws, "git diff --no-ext-diff -- " + quoteShell(context.tracked)));
-        assert.ok(checkExec(diff, "git diff").includes("agent-workload-"), "tracked edit absent from git diff");
+        await recorder.measure(m("git_status", handle.id), async () => {
+          const status = await client.workspace.exec(handle.ws, "git status --porcelain=v1 --untracked-files=no");
+          assert.ok(checkExec(status, "git status").trim(), "edited tracked file absent from git status");
+        });
+        await recorder.measure(m("git_diff", handle.id), async () => {
+          const diff = await client.workspace.exec(handle.ws, "git diff --no-ext-diff -- " + quoteShell(context.tracked));
+          assert.ok(checkExec(diff, "git diff").includes("agent-workload-"), "tracked edit absent from git diff");
+        });
       } else {
-        const status = await recorder.measure(m("git_status", handle.id), () => gitAsync(["status", "--porcelain=v1", "--untracked-files=no"], handle.path));
-        assert.ok(status.trim(), "edited tracked file absent from git status");
-        const diff = await recorder.measure(m("git_diff", handle.id), () => gitAsync(["diff", "--no-ext-diff", "--", context.tracked], handle.path));
-        assert.ok(diff.includes("agent-workload-"), "tracked edit absent from git diff");
+        await recorder.measure(m("git_status", handle.id), async () => {
+          const status = await gitAsync(["status", "--porcelain=v1", "--untracked-files=no"], handle.path);
+          assert.ok(status.trim(), "edited tracked file absent from git status");
+        });
+        await recorder.measure(m("git_diff", handle.id), async () => {
+          const diff = await gitAsync(["diff", "--no-ext-diff", "--", context.tracked], handle.path);
+          assert.ok(diff.includes("agent-workload-"), "tracked edit absent from git diff");
+        });
       }
     }));
   } catch (caught) {
@@ -346,7 +365,9 @@ async function main() {
     });
     const files = selectedFiles(snapshot);
     if (!files.length) throw new Error("source has no nonempty tracked UTF-8 text files <=16 KiB");
-    const tracked = files.includes("README.md") ? "README.md" : files.find((name) => extname(name) === ".md") ?? files[0];
+    const editableTypes = new Set([".md", ".rs", ".js", ".mjs", ".ts", ".tsx", ".py", ".toml", ".txt", ".yml", ".yaml"]);
+    const tracked = files.includes("README.md") ? "README.md" : files.find((name) => extname(name) === ".md") ?? files.find((name) => editableTypes.has(extname(name)));
+    if (!tracked) throw new Error("source has no text file with a safe comment syntax for a tracked diff");
     const context = {
       snapshot, sha, files, tracked, trackedContent: readFileSync(join(snapshot, tracked), "utf8"),
       runId, cacheProofs: metadata.cache_proofs,
